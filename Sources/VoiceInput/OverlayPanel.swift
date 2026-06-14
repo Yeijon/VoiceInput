@@ -138,9 +138,9 @@ final class OverlayPanel: NSPanel {
         waveformView.setLevel(CGFloat(level))
     }
 
-    func showRefining() {
+    func showProcessing(_ text: String = "Translating...") {
         waveformView.isAnimating = false
-        updateText("Refining...")
+        updateText(text)
     }
 
     func dismiss() {

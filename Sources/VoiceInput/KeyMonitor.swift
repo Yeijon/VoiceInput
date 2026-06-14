@@ -1,12 +1,15 @@
 import Cocoa
 
 final class KeyMonitor {
-    var onFnDown: (() -> Void)?
-    var onFnUp: (() -> Void)?
+    var onFnDown: ((RecordingMode) -> Void)?
+    var onFnUp: ((RecordingMode) -> Void)?
+    var onModeChanged: ((RecordingMode) -> Void)?
 
     private var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var fnPressed = false
+    private var optionPressed = false
+    private var sawOptionWhileFnPressed = false
 
     /// Start monitoring. Returns false if accessibility permission is missing.
     func start() -> Bool {
@@ -60,15 +63,28 @@ final class KeyMonitor {
 
         let flags = event.flags
         let fnDown = flags.contains(.maskSecondaryFn)
+        let optionDown = flags.contains(.maskAlternate)
+        let previousOptionPressed = optionPressed
+        optionPressed = optionDown
 
         if fnDown && !fnPressed {
             fnPressed = true
-            DispatchQueue.main.async { [weak self] in self?.onFnDown?() }
+            sawOptionWhileFnPressed = optionDown
+            let mode: RecordingMode = sawOptionWhileFnPressed ? .translation : .dictation
+            DispatchQueue.main.async { [weak self] in self?.onFnDown?(mode) }
             return nil // suppress Fn press (prevents emoji picker)
         } else if !fnDown && fnPressed {
             fnPressed = false
-            DispatchQueue.main.async { [weak self] in self?.onFnUp?() }
+            let mode: RecordingMode = sawOptionWhileFnPressed ? .translation : .dictation
+            sawOptionWhileFnPressed = false
+            DispatchQueue.main.async { [weak self] in self?.onFnUp?(mode) }
             return nil // suppress Fn release
+        } else if fnPressed && optionDown != previousOptionPressed {
+            if optionDown {
+                sawOptionWhileFnPressed = true
+            }
+            let mode: RecordingMode = sawOptionWhileFnPressed ? .translation : .dictation
+            DispatchQueue.main.async { [weak self] in self?.onModeChanged?(mode) }
         }
 
         return Unmanaged.passRetained(event)

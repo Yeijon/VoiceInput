@@ -6,20 +6,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let keyMonitor = KeyMonitor()
     private let speechEngine = SpeechEngine()
     private let textInjector = TextInjector()
+    private let translationService = TranslationService.shared
+    private let settings = AppSettings.shared
     private lazy var overlayPanel = OverlayPanel()
 
     private var isEnabled = true
     private var isRecording = false
+    private var currentMode: RecordingMode = .dictation
     private var lastPartialResult = ""
     private var finalResultTimer: Timer?
 
     private var enableMenuItem: NSMenuItem!
-    private var llmMenuItem: NSMenuItem!
     private lazy var settingsWindow = SettingsWindow()
     private var languageItems: [NSMenuItem] = []
+    private var targetLanguageItems: [NSMenuItem] = []
     private var selectedLocaleCode: String {
-        get { UserDefaults.standard.string(forKey: "selectedLocaleCode") ?? "zh-CN" }
-        set { UserDefaults.standard.set(newValue, forKey: "selectedLocaleCode") }
+        get { settings.selectedLocaleCode }
+        set { settings.selectedLocaleCode = newValue }
     }
 
     // MARK: - Lifecycle
@@ -43,28 +46,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showAccessibilityAlert()
         }
 
-        keyMonitor.onFnDown = { [weak self] in self?.fnDown() }
-        keyMonitor.onFnUp = { [weak self] in self?.fnUp() }
+        keyMonitor.onFnDown = { [weak self] mode in self?.fnDown(mode: mode) }
+        keyMonitor.onModeChanged = { [weak self] mode in self?.updateRecordingMode(mode) }
+        keyMonitor.onFnUp = { [weak self] mode in self?.fnUp(mode: mode) }
     }
 
     // MARK: - Key events
 
-    private func fnDown() {
+    private func fnDown(mode: RecordingMode) {
         guard isEnabled, !isRecording else { return }
-        LLMRefiner.shared.cancel()
+        translationService.cancel()
         isRecording = true
+        currentMode = mode
         lastPartialResult = ""
 
         updateStatusIcon(recording: true)
-        overlayPanel.show(text: "Listening...")
+        overlayPanel.show(text: mode == .translation ? "Listening for translation..." : "Listening...")
         NSSound(named: .init("Tink"))?.play()
 
         speechEngine.startRecording()
     }
 
-    private func fnUp() {
+    private func updateRecordingMode(_ mode: RecordingMode) {
+        guard isRecording else { return }
+        currentMode = mode
+        if lastPartialResult.isEmpty {
+            overlayPanel.updateText(mode == .translation ? "Listening for translation..." : "Listening...")
+        }
+    }
+
+    private func fnUp(mode: RecordingMode) {
         guard isRecording else { return }
         isRecording = false
+        currentMode = mode
 
         updateStatusIcon(recording: false)
         speechEngine.stopRecording()
@@ -117,48 +131,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !text.isEmpty else {
             overlayPanel.dismiss()
             lastPartialResult = ""
+            currentMode = .dictation
             return
         }
 
-        let refiner = LLMRefiner.shared
-        if refiner.isEnabled && refiner.isConfigured {
-            overlayPanel.showRefining()
-            refiner.refine(text) { [weak self] result in
+        if currentMode == .translation {
+            overlayPanel.showProcessing("Translating...")
+            translationService.translate(text, sourceLocaleCode: selectedLocaleCode) { [weak self] result in
                 guard let self else { return }
-                let finalText: String
                 switch result {
-                case .success(let refined):
-                    finalText = refined.isEmpty ? text : refined
-                    let wasRefined = finalText != text
-                    if wasRefined {
-                        self.overlayPanel.updateText("✨ \(finalText)")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                            self.overlayPanel.dismiss()
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                self.textInjector.inject(finalText)
-                                NSSound(named: .init("Pop"))?.play()
-                            }
-                        }
-                    } else {
+                case .success(let translated):
+                    self.overlayPanel.updateText("⇄ \(translated.text)")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                         self.overlayPanel.dismiss()
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.textInjector.inject(finalText)
+                            self.textInjector.inject(translated.text)
                             NSSound(named: .init("Pop"))?.play()
                         }
                     }
                 case .failure(let error):
-                    NSLog("[LLMRefiner] Refine failed: %@", error.localizedDescription)
-                    finalText = text
-                    self.overlayPanel.updateText("Refine failed: \(error.localizedDescription)")
+                    voiceInputLogger.error("Translation failed: \(error.localizedDescription, privacy: .public)")
+                    self.overlayPanel.updateText("Translation failed: \(error.localizedDescription)")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                         self.overlayPanel.dismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            self.textInjector.inject(finalText)
-                            NSSound(named: .init("Pop"))?.play()
-                        }
                     }
                 }
                 self.lastPartialResult = ""
+                self.currentMode = .dictation
             }
         } else {
             overlayPanel.dismiss()
@@ -167,6 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NSSound(named: .init("Pop"))?.play()
             }
             lastPartialResult = ""
+            currentMode = .dictation
         }
     }
 
@@ -206,23 +206,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         langItem.submenu = langMenu
         menu.addItem(langItem)
 
-        // LLM Refinement submenu
-        let llmItem = NSMenuItem(title: "LLM Refinement", action: nil, keyEquivalent: "")
-        let llmMenu = NSMenu()
+        let translationItem = NSMenuItem(title: "Translation", action: nil, keyEquivalent: "")
+        let translationMenu = NSMenu()
 
-        llmMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleLLM), keyEquivalent: "")
-        llmMenuItem.target = self
-        llmMenuItem.state = LLMRefiner.shared.isEnabled ? .on : .off
-        llmMenu.addItem(llmMenuItem)
+        let targetItem = NSMenuItem(title: "Translate To", action: nil, keyEquivalent: "")
+        let targetMenu = NSMenu()
+        for language in TranslationLanguages.supported {
+            let item = NSMenuItem(title: language.title, action: #selector(changeTargetLanguage(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = language.appValue
+            item.state = language.appValue == settings.targetLocaleCode ? .on : .off
+            targetLanguageItems.append(item)
+            targetMenu.addItem(item)
+        }
+        targetItem.submenu = targetMenu
+        translationMenu.addItem(targetItem)
 
-        llmMenu.addItem(.separator())
-
-        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openLLMSettings), keyEquivalent: "")
+        let settingsItem = NSMenuItem(title: "Settings...", action: #selector(openTranslationSettings), keyEquivalent: "")
         settingsItem.target = self
-        llmMenu.addItem(settingsItem)
+        translationMenu.addItem(settingsItem)
 
-        llmItem.submenu = llmMenu
-        menu.addItem(llmItem)
+        let historyItem = NSMenuItem(title: "Open Translation History", action: #selector(openTranslationHistory), keyEquivalent: "")
+        historyItem.target = self
+        translationMenu.addItem(historyItem)
+
+        translationItem.submenu = translationMenu
+        menu.addItem(translationItem)
 
         menu.addItem(.separator())
 
@@ -271,15 +280,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func toggleLLM() {
-        let refiner = LLMRefiner.shared
-        refiner.isEnabled.toggle()
-        llmMenuItem.state = refiner.isEnabled ? .on : .off
+    @objc private func changeTargetLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String else { return }
+        settings.targetLocaleCode = code
+        for item in targetLanguageItems {
+            item.state = (item.representedObject as? String) == code ? .on : .off
+        }
     }
 
-    @objc private func openLLMSettings() {
+    @objc private func openTranslationSettings() {
         settingsWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openTranslationHistory() {
+        NSWorkspace.shared.open(translationService.historyFileURL())
     }
 
     @objc private func quit() {
