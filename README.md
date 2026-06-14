@@ -1,3 +1,5 @@
+Thank you for the inspiration: <https://github.com/yetone/voice-input-dist>
+
 # VoiceInput
 
 VoiceInput is a macOS menu-bar app for fast voice input.
